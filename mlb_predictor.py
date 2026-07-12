@@ -38,8 +38,15 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
+import requests
 
 warnings.filterwarnings("ignore")
+
+# Windows consoles often default to cp1252; keep accented names readable.
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 
 # --------------------------------------------------------------------------
 # Third-party data / ML libraries (graceful degradation where possible)
@@ -249,9 +256,12 @@ def _statcast_pitcher_window(pid: int, start: dt.date, end: dt.date) -> Optional
 
 
 def pitcher_form_last30(pid: Optional[int], asof: dt.date) -> dict:
-    """K/9, BB/9, GB% from the pitcher's last 30 days of Statcast data."""
+    """K/9, BB/9, GB% and an xFIP proxy from the pitcher's last 30 days of
+    Statcast data. The xFIP proxy uses the standard formula with expected HR
+    = fly balls x league HR/FB (10.5%); it backs up FanGraphs, which some
+    networks block (Cloudflare 403)."""
     out = {"k9": LEAGUE_AVG["k9"], "bb9": LEAGUE_AVG["bb9"],
-           "gb_pct": LEAGUE_AVG["gb_pct"]}
+           "gb_pct": LEAGUE_AVG["gb_pct"], "xfip_proxy": None}
     if pid is None:
         return out
     df = _statcast_pitcher_window(pid, asof - dt.timedelta(days=30), asof)
@@ -273,6 +283,11 @@ def pitcher_form_last30(pid: Optional[int], asof: dt.date) -> dict:
     bip = df.dropna(subset=["bb_type"])
     if len(bip) >= 10:
         out["gb_pct"] = round((bip["bb_type"] == "ground_ball").mean(), 3)
+
+    fb = (bip["bb_type"] == "fly_ball").sum()
+    hbp = ev["events"].eq("hit_by_pitch").sum()
+    out["xfip_proxy"] = round(
+        (13 * fb * 0.105 + 3 * (bb + hbp) - 2 * k) / ip + 3.10, 2)
     return out
 
 
@@ -283,31 +298,62 @@ def _norm_name(name: str) -> str:
     return re.sub(r"[^a-z ]", "", (name or "").lower()).strip()
 
 
-def pitcher_xfip(name: str, season: int) -> float:
+def pitcher_xfip(name: str, season: int,
+                 proxy: Optional[float] = None) -> float:
     """Season xFIP from FanGraphs (name-matched); pybaseball can't split
-    FanGraphs advanced stats by arbitrary date range, so season is used."""
+    FanGraphs advanced stats by arbitrary date range, so season is used.
+    Falls back to the Statcast-derived 30-day proxy when FanGraphs is
+    unreachable, then to league average."""
     global _FG_PITCHING_CACHE
     if _FG_PITCHING_CACHE is None:
         try:
             _FG_PITCHING_CACHE = pitching_stats(season, season, qual=0)
         except Exception as exc:
-            print(f"    [warn] FanGraphs pitching_stats failed: {exc}")
+            print(f"    [warn] FanGraphs pitching_stats failed ({exc}); "
+                  f"using Statcast xFIP proxy.")
             _FG_PITCHING_CACHE = pd.DataFrame()
     df = _FG_PITCHING_CACHE
+    fallback = proxy if proxy is not None else LEAGUE_AVG["xfip"]
     if df.empty or "xFIP" not in df.columns:
-        return LEAGUE_AVG["xfip"]
+        return fallback
     match = df[df["Name"].map(_norm_name) == _norm_name(name)]
     if match.empty:
-        return LEAGUE_AVG["xfip"]
+        return fallback
     val = match.iloc[0]["xFIP"]
-    return float(val) if pd.notna(val) else LEAGUE_AVG["xfip"]
+    return float(val) if pd.notna(val) else fallback
 
 
 _FG_TEAM_BATTING_CACHE: Optional[pd.DataFrame] = None
+_MLB_TEAM_HITTING_CACHE: Optional[dict] = None
+
+
+def _mlb_api_team_hitting(season: int) -> dict:
+    """All 30 teams' season hitting stats straight from the MLB Stats API
+    (one call, no auth, not Cloudflare-gated). Returns
+    {team_name: {"obp": float, "ops": float}} plus "_league_ops"."""
+    global _MLB_TEAM_HITTING_CACHE
+    if _MLB_TEAM_HITTING_CACHE is not None:
+        return _MLB_TEAM_HITTING_CACHE
+    out: dict = {}
+    try:
+        url = (f"https://statsapi.mlb.com/api/v1/teams/stats"
+               f"?season={season}&group=hitting&stats=season&sportIds=1")
+        splits = requests.get(url, timeout=30).json()["stats"][0]["splits"]
+        ops_vals = []
+        for s in splits:
+            obp, ops = float(s["stat"]["obp"]), float(s["stat"]["ops"])
+            out[s["team"]["name"]] = {"obp": obp, "ops": ops}
+            ops_vals.append(ops)
+        out["_league_ops"] = float(np.mean(ops_vals)) if ops_vals else 0.715
+    except Exception as exc:
+        print(f"    [warn] MLB API team hitting failed: {exc}")
+    _MLB_TEAM_HITTING_CACHE = out
+    return out
 
 
 def team_offense(team_name: str, season: int) -> dict:
-    """Season team wRC+ and OBP from FanGraphs team_batting.
+    """Season team wRC+ and OBP -- FanGraphs team_batting first, MLB Stats
+    API second (with wRC+ approximated by OPS indexed to league average).
 
     NOTE: pybaseball does not expose FanGraphs L/R platoon splits, so season
     aggregates stand in for 'vs opposing starter handedness'. The feature
@@ -319,19 +365,25 @@ def team_offense(team_name: str, season: int) -> dict:
         try:
             _FG_TEAM_BATTING_CACHE = team_batting(season, season)
         except Exception as exc:
-            print(f"    [warn] FanGraphs team_batting failed: {exc}")
+            print(f"    [warn] FanGraphs team_batting failed ({exc}); "
+                  f"falling back to MLB Stats API.")
             _FG_TEAM_BATTING_CACHE = pd.DataFrame()
     df = _FG_TEAM_BATTING_CACHE
     abbr = TEAM_TO_FG.get(team_name)
-    if df.empty or abbr is None or "Team" not in df.columns:
-        return out
-    row = df[df["Team"] == abbr]
-    if row.empty:
-        return out
-    if "wRC+" in row.columns and pd.notna(row.iloc[0]["wRC+"]):
-        out["wrc_plus"] = float(row.iloc[0]["wRC+"])
-    if "OBP" in row.columns and pd.notna(row.iloc[0]["OBP"]):
-        out["obp"] = float(row.iloc[0]["OBP"])
+    if not df.empty and abbr is not None and "Team" in df.columns:
+        row = df[df["Team"] == abbr]
+        if not row.empty:
+            if "wRC+" in row.columns and pd.notna(row.iloc[0]["wRC+"]):
+                out["wrc_plus"] = float(row.iloc[0]["wRC+"])
+            if "OBP" in row.columns and pd.notna(row.iloc[0]["OBP"]):
+                out["obp"] = float(row.iloc[0]["OBP"])
+            return out
+
+    mlb = _mlb_api_team_hitting(season)
+    if team_name in mlb:
+        out["obp"] = mlb[team_name]["obp"]
+        league_ops = mlb.get("_league_ops", 0.715)
+        out["wrc_plus"] = round(100.0 * mlb[team_name]["ops"] / league_ops, 1)
     return out
 
 
@@ -386,10 +438,12 @@ def build_moneyline_features(game: GameInfo, asof: dt.date, season: int) -> dict
     a_off = team_offense(game.away_team, season)
     return {
         "home_sp_k9": h_form["k9"], "home_sp_bb9": h_form["bb9"],
-        "home_sp_xfip": pitcher_xfip(game.home_pitcher_name, season),
+        "home_sp_xfip": pitcher_xfip(game.home_pitcher_name, season,
+                                     proxy=h_form["xfip_proxy"]),
         "home_sp_gb_pct": h_form["gb_pct"],
         "away_sp_k9": a_form["k9"], "away_sp_bb9": a_form["bb9"],
-        "away_sp_xfip": pitcher_xfip(game.away_pitcher_name, season),
+        "away_sp_xfip": pitcher_xfip(game.away_pitcher_name, season,
+                                     proxy=a_form["xfip_proxy"]),
         "away_sp_gb_pct": a_form["gb_pct"],
         "home_team_wrc_plus": h_off["wrc_plus"], "home_team_obp": h_off["obp"],
         "away_team_wrc_plus": a_off["wrc_plus"], "away_team_obp": a_off["obp"],
@@ -508,11 +562,12 @@ def _synthetic_history(n: int = 4000) -> pd.DataFrame:
     df["away_sp_xra9"] = df["away_sp_xfip"]
     df["combined_sp_xra9"] = df["home_sp_xra9"] + df["away_sp_xra9"]
 
-    # Latent run expectations drive correlated, realistic targets.
-    home_exp = (0.55 * df["away_sp_xra9"] + 0.25 * df["away_bullpen_era14"]) \
-        * (df["home_team_wrc_plus"] / 100) * df["park_factor"] * 0.55 + 0.15  # home edge
-    away_exp = (0.55 * df["home_sp_xra9"] + 0.25 * df["home_bullpen_era14"]) \
-        * (df["away_team_wrc_plus"] / 100) * df["park_factor"] * 0.55
+    # Latent run expectations drive correlated, realistic targets,
+    # calibrated so team runs average ~4.4 (league total ~8.8).
+    home_exp = (0.55 * df["away_sp_xra9"] + 0.30 * df["away_bullpen_era14"]) \
+        * (df["home_team_wrc_plus"] / 100) * df["park_factor"] * 1.25 + 0.15  # home edge
+    away_exp = (0.55 * df["home_sp_xra9"] + 0.30 * df["home_bullpen_era14"]) \
+        * (df["away_team_wrc_plus"] / 100) * df["park_factor"] * 1.25
     df[TARGET_HOME_RUNS] = rng.poisson(np.clip(home_exp, 1.5, 9))
     df[TARGET_AWAY_RUNS] = rng.poisson(np.clip(away_exp, 1.5, 9))
     df[TARGET_TOTAL_RUNS] = df[TARGET_HOME_RUNS] + df[TARGET_AWAY_RUNS]

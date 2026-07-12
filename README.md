@@ -12,7 +12,7 @@ Predicts three betting markets for every game on today's MLB slate:
 
 ```bash
 pip install -r requirements.txt
-python mlb_predictor.py              # today's slate
+python mlb_predictor.py            
 python mlb_predictor.py --date 2026-07-12
 ```
 
@@ -65,6 +65,9 @@ loud warning — useful for testing the pipeline, useless for betting.
 - FanGraphs advanced stats (xFIP, wRC+) are season-level; pybaseball
   cannot split them by arbitrary date range or batter handedness, so
   "vs. opposing starter handedness" uses season aggregates.
+- FanGraphs Cloudflare-blocks some networks (HTTP 403). When that
+  happens the script substitutes a Statcast-derived 30-day xFIP proxy
+  for pitchers and MLB Stats API OBP + OPS-indexed wRC+ for teams.
 - 1st-inning "ERA" is really RA/9 (unearned runs included) computed
   from Statcast score deltas.
 - Cold-cache Statcast pulls take ~30–60 s per pitcher; `pybaseball`

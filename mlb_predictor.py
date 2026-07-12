@@ -1,30 +1,3 @@
-"""
-mlb_predictor.py
-================
-End-to-end MLB daily prediction system.
-
-Markets covered (separate model per market):
-  1. Moneyline (outright winner)          -> XGBClassifier  (.predict_proba)
-  2. Total runs (away / home / combined)  -> 3x XGBRegressor
-  3. NRFI / YRFI (run in the 1st inning)  -> XGBClassifier  (.predict_proba)
-
-Data sources:
-  - MLB-StatsAPI (statsapi):  today's schedule, probable pitchers, lineups,
-    player season splits (OBP / ISO).
-  - pybaseball:  Statcast pitch-level data (last-30-day pitcher form,
-    1st-inning splits), FanGraphs season stats (xFIP, wRC+, OBP),
-    Baseball-Reference daily logs (last-14-day bullpen ERA).
-
-Training data:
-  Expects ./mlb_history_2024_2025.csv (schema documented in README.md).
-  If the file is missing the script trains on SYNTHETIC data so the full
-  pipeline can still be exercised -- a loud warning is printed.
-
-Usage:
-  python mlb_predictor.py                # today's slate
-  python mlb_predictor.py --date 2026-07-12
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -42,31 +15,29 @@ import requests
 
 warnings.filterwarnings("ignore")
 
-# Windows consoles often default to cp1252; keep accented names readable.
+
 try:
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
     pass
 
-# --------------------------------------------------------------------------
-# Third-party data / ML libraries (graceful degradation where possible)
-# --------------------------------------------------------------------------
-import statsapi  # MLB-StatsAPI wrapper
+
+import statsapi 
 
 import pybaseball
 from pybaseball import (
-    pitching_stats,           # FanGraphs season pitching (xFIP, ...)
-    pitching_stats_range,     # Baseball-Reference daily logs (bullpen form)
-    statcast_pitcher,         # Statcast pitch-level data by MLBAM id
-    team_batting,             # FanGraphs team batting (wRC+, OBP)
+    pitching_stats,           
+    pitching_stats_range,     
+    statcast_pitcher,       
+    team_batting,            
 )
 
-pybaseball.cache.enable()  # cache Statcast/FanGraphs pulls between runs
+pybaseball.cache.enable()  
 
 try:
     from xgboost import XGBClassifier, XGBRegressor
     _HAVE_XGB = True
-except ImportError:  # fall back to sklearn if xgboost is not installed
+except ImportError:  
     from sklearn.ensemble import (
         RandomForestClassifier as XGBClassifier,
         RandomForestRegressor as XGBRegressor,
@@ -76,22 +47,18 @@ except ImportError:  # fall back to sklearn if xgboost is not installed
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, mean_absolute_error
 
-# ==========================================================================
-# Constants
-# ==========================================================================
+
 HISTORY_CSV = "mlb_history_2024_2025.csv"
 
-# League-average fallbacks used whenever a specific stat cannot be fetched
-# (unannounced starter, API timeout, rookie with no sample, ...).
+
 LEAGUE_AVG = {
     "k9": 8.6, "bb9": 3.2, "xfip": 4.10, "gb_pct": 0.435,
     "wrc_plus": 100.0, "obp": 0.315,
     "bullpen_era14": 4.20, "park_factor": 1.00,
-    "fi_ra9": 4.40, "fi_bb_rate": 0.085,   # 1st-inning run env is hotter
-    "top3_obp": 0.335, "top3_iso": 0.165,  # top of order > league avg
+    "fi_ra9": 4.40, "fi_bb_rate": 0.085,  
+    "top3_obp": 0.335, "top3_iso": 0.165,  
 }
 
-# statsapi full team name -> FanGraphs abbreviation (for team_batting joins)
 TEAM_TO_FG = {
     "Arizona Diamondbacks": "ARI", "Atlanta Braves": "ATL",
     "Baltimore Orioles": "BAL", "Boston Red Sox": "BOS",
@@ -111,9 +78,7 @@ TEAM_TO_FG = {
     "Washington Nationals": "WSN",
 }
 
-# Runs park factors (FanGraphs 3-yr basic, 100 = neutral -> stored /100).
-# pybaseball has no stable park-factor endpoint, so these are embedded and
-# refreshed via _try_fetch_park_factors() when FanGraphs is reachable.
+
 PARK_FACTORS = {
     "Arizona Diamondbacks": 1.03, "Atlanta Braves": 1.02,
     "Baltimore Orioles": 0.98, "Boston Red Sox": 1.06,
@@ -133,7 +98,7 @@ PARK_FACTORS = {
     "Washington Nationals": 1.00,
 }
 
-# Feature schemas -- the training CSV must contain these exact columns.
+
 ML_FEATURES = [
     "home_sp_k9", "home_sp_bb9", "home_sp_xfip", "home_sp_gb_pct",
     "away_sp_k9", "away_sp_bb9", "away_sp_xfip", "away_sp_gb_pct",
@@ -153,16 +118,14 @@ NRFI_FEATURES = [
     "away_top3_obp", "away_top3_iso",
 ]
 
-TARGET_ML = "home_win"            # 1 if home team won
+TARGET_ML = "home_win"           
 TARGET_HOME_RUNS = "home_runs"
 TARGET_AWAY_RUNS = "away_runs"
 TARGET_TOTAL_RUNS = "total_runs"
-TARGET_NRFI = "first_inning_run"  # 1 if a run scored in the 1st (YRFI)
+TARGET_NRFI = "first_inning_run"  
 
 
-# ==========================================================================
-# STEP 1 -- The Daily Data Loader
-# ==========================================================================
+
 @dataclass
 class GameInfo:
     game_pk: int
@@ -172,7 +135,7 @@ class GameInfo:
     home_pitcher_name: str
     away_pitcher_id: Optional[int] = None
     home_pitcher_id: Optional[int] = None
-    away_lineup_ids: list = field(default_factory=list)  # MLBAM batter ids 1-9
+    away_lineup_ids: list = field(default_factory=list)  
     home_lineup_ids: list = field(default_factory=list)
 
 
@@ -212,7 +175,7 @@ def load_todays_games(date_str: str) -> list[GameInfo]:
         return games
 
     for g in sched:
-        if g.get("game_type") not in ("R", "F", "D", "L", "W"):  # skip exhib.
+        if g.get("game_type") not in ("R", "F", "D", "L", "W"): 
             continue
         info = GameInfo(
             game_pk=g["game_id"],
@@ -232,9 +195,7 @@ def load_todays_games(date_str: str) -> list[GameInfo]:
     return games
 
 
-# ==========================================================================
-# Shared fetch helpers (Statcast / FanGraphs / B-Ref), all with fallbacks
-# ==========================================================================
+
 _EVENT_OUTS = {
     "strikeout": 1, "strikeout_double_play": 2, "field_out": 1,
     "force_out": 1, "grounded_into_double_play": 2, "double_play": 2,
@@ -273,7 +234,7 @@ def pitcher_form_last30(pid: Optional[int], asof: dt.date) -> dict:
         return out
     outs = ev["events"].map(_EVENT_OUTS).fillna(0).sum()
     ip = outs / 3.0
-    if ip < 3:  # sample too small to trust
+    if ip < 3: 
         return out
     k = ev["events"].str.contains("strikeout").sum()
     bb = ev["events"].isin(["walk", "intent_walk"]).sum()
@@ -427,9 +388,7 @@ def get_park_factor(home_team: str) -> float:
     return PARK_FACTORS.get(home_team, LEAGUE_AVG["park_factor"])
 
 
-# ==========================================================================
-# STEP 2 -- Feature Engineering: Moneyline
-# ==========================================================================
+
 def build_moneyline_features(game: GameInfo, asof: dt.date, season: int) -> dict:
     """Last-30-day starter form + season xFIP + team offense for both sides."""
     h_form = pitcher_form_last30(game.home_pitcher_id, asof)
@@ -450,9 +409,7 @@ def build_moneyline_features(game: GameInfo, asof: dt.date, season: int) -> dict
     }
 
 
-# ==========================================================================
-# STEP 3 -- Feature Engineering: Totals
-# ==========================================================================
+
 def build_totals_features(game: GameInfo, ml_feats: dict, asof: dt.date) -> dict:
     """Starter expected runs allowed (xFIP as RA/9 proxy), 14-day bullpen
     ERA, park factor, plus each offense's wRC+."""
@@ -470,9 +427,7 @@ def build_totals_features(game: GameInfo, ml_feats: dict, asof: dt.date) -> dict
     }
 
 
-# ==========================================================================
-# STEP 4 -- Feature Engineering: NRFI / YRFI (1st-inning only)
-# ==========================================================================
+
 def pitcher_first_inning(pid: Optional[int], asof: dt.date) -> dict:
     """1st-inning RA/9 (run-average, computed from Statcast score deltas)
     and 1st-inning walk rate over the pitcher's last ~90 days of starts."""
@@ -487,9 +442,8 @@ def pitcher_first_inning(pid: Optional[int], asof: dt.date) -> dict:
         return out
 
     starts = fi["game_pk"].nunique()
-    if starts < 3:  # too few first innings to be meaningful
+    if starts < 3: 
         return out
-    # Runs allowed on each pitch = batting team's score delta on that pitch.
     runs = (fi["post_bat_score"] - fi["bat_score"]).clip(lower=0).sum()
     out["fi_ra9"] = round(9.0 * runs / starts, 2)
 
@@ -537,9 +491,7 @@ def build_nrfi_features(game: GameInfo, asof: dt.date) -> dict:
     }
 
 
-# ==========================================================================
-# STEP 5 -- Model Training & Inference
-# ==========================================================================
+
 def _synthetic_history(n: int = 4000) -> pd.DataFrame:
     """Generate plausible synthetic training rows so the pipeline runs even
     without mlb_history_2024_2025.csv. NOT for real betting use."""
@@ -631,7 +583,7 @@ def train_models(hist: pd.DataFrame) -> ModelBundle:
     engine = "XGBoost" if _HAVE_XGB else "RandomForest (xgboost not installed)"
     print(f"  Engine: {engine}")
 
-    # --- Moneyline classifier -------------------------------------------
+
     X, y = hist[ML_FEATURES], hist[TARGET_ML]
     Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, random_state=42,
                                           stratify=y)
@@ -639,7 +591,7 @@ def train_models(hist: pd.DataFrame) -> ModelBundle:
     print(f"  Moneyline  holdout accuracy: "
           f"{accuracy_score(yte, ml_model.predict(Xte)):.3f}")
 
-    # --- Totals regressors (home / away / combined) ---------------------
+
     regs = {}
     for tag, target in (("home", TARGET_HOME_RUNS), ("away", TARGET_AWAY_RUNS),
                         ("total", TARGET_TOTAL_RUNS)):
@@ -649,7 +601,6 @@ def train_models(hist: pd.DataFrame) -> ModelBundle:
         print(f"  Totals[{tag:<5}] holdout MAE: "
               f"{mean_absolute_error(yte, regs[tag].predict(Xte)):.2f} runs")
 
-    # --- NRFI classifier -------------------------------------------------
     X, y = hist[NRFI_FEATURES], hist[TARGET_NRFI]
     Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, random_state=42,
                                           stratify=y)
@@ -666,11 +617,11 @@ def train_models(hist: pd.DataFrame) -> ModelBundle:
 class Prediction:
     game: GameInfo
     winner: str
-    winner_conf: float          # strict percentage from .predict_proba()
+    winner_conf: float          
     away_runs: float
     home_runs: float
     total_runs: float
-    first_inning: str           # "NRFI" or "YRFI"
+    first_inning: str          
     first_inning_conf: float
 
 
@@ -680,19 +631,18 @@ def predict_game(models: ModelBundle, game: GameInfo,
     Xtot = pd.DataFrame([tot_row])[TOTALS_FEATURES]
     Xfi = pd.DataFrame([nrfi_row])[NRFI_FEATURES]
 
-    # Moneyline: proba of class 1 == home win
+
     p_home = float(models.moneyline.predict_proba(Xml)[0][1])
     winner = game.home_team if p_home >= 0.5 else game.away_team
     winner_conf = max(p_home, 1 - p_home) * 100
 
     home_r = max(0.0, float(models.home_runs.predict(Xtot)[0]))
     away_r = max(0.0, float(models.away_runs.predict(Xtot)[0]))
-    # Blend the dedicated combined-total model with the sum of team models
-    # so the three numbers stay mutually coherent.
+
     total_direct = max(0.0, float(models.total_runs.predict(Xtot)[0]))
     total_r = 0.5 * total_direct + 0.5 * (home_r + away_r)
 
-    # NRFI: class 1 == a run scored in the 1st (YRFI)
+
     p_yrfi = float(models.nrfi.predict_proba(Xfi)[0][1])
     call = "YRFI" if p_yrfi >= 0.5 else "NRFI"
     fi_conf = max(p_yrfi, 1 - p_yrfi) * 100
@@ -702,9 +652,6 @@ def predict_game(models: ModelBundle, game: GameInfo,
                       first_inning=call, first_inning_conf=fi_conf)
 
 
-# ==========================================================================
-# STEP 6 -- The Final Output Formatter
-# ==========================================================================
 def print_predictions(preds: list[Prediction]) -> None:
     print("\n" + "=" * 62)
     print(" TODAY'S MLB PREDICTIONS")
@@ -722,9 +669,7 @@ def print_predictions(preds: list[Prediction]) -> None:
         print("\nNo games scheduled today.")
 
 
-# ==========================================================================
-# Main
-# ==========================================================================
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Daily MLB market predictor")
     parser.add_argument("--date", default=dt.date.today().strftime("%Y-%m-%d"),
@@ -734,27 +679,27 @@ def main() -> None:
     asof = dt.datetime.strptime(args.date, "%Y-%m-%d").date()
     season = asof.year
 
-    # Step 1 -- schedule / pitchers / lineups
+
     games = load_todays_games(args.date)
     if not games:
         print("No games found; exiting.")
         return
 
-    # Step 5 (training happens once, before per-game feature pulls)
+
     models = train_models(load_history())
 
-    # Steps 2-4 -- per-game feature engineering, then inference
+
     print("\n[Steps 2-4] Building feature matrices "
           "(Statcast pulls may take a minute per pitcher on a cold cache)...")
     preds: list[Prediction] = []
     for game in games:
         print(f"  Features: {game.away_team} @ {game.home_team}")
-        ml_row = build_moneyline_features(game, asof, season)     # Step 2
-        tot_row = build_totals_features(game, ml_row, asof)       # Step 3
-        nrfi_row = build_nrfi_features(game, asof)                # Step 4
+        ml_row = build_moneyline_features(game, asof, season)     
+        tot_row = build_totals_features(game, ml_row, asof)       
+        nrfi_row = build_nrfi_features(game, asof)             
         preds.append(predict_game(models, game, ml_row, tot_row, nrfi_row))
 
-    # Step 6 -- formatted console output
+    
     print_predictions(preds)
 
 

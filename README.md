@@ -142,15 +142,3 @@ home_sp_id, away_sp_id`) that the trainer ignores.
 These are what leak-free numbers look like. Anything dramatically
 better on this feature set usually means lookahead bias.
 
-## Known limitations
-
-- The wRC+ proxy is wOBA indexed to league average — it is not
-  park-adjusted the way real wRC+ is.
-- Bullpen and 1st-inning "ERA" are really RA/9 (unearned runs
-  included). For NRFI that is a feature, not a bug.
-- Savant team codes differ from B-Ref (`AZ/ARI`, `CWS/CHW`, and the
-  Athletics are retroactively `ATH` even for Oakland 2024) — handled in
-  the mapping tables.
-- Park factors are embedded constants (no stable pybaseball endpoint);
-  Sacramento's Sutter Health Park is estimated at 1.05.
-- This is a modeling exercise, not betting advice.
